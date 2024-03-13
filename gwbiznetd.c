@@ -56,6 +56,11 @@ struct curl_data {
 };
 
 enum {
+	WAKE_UP_PRODUCER_WHEN_POOL_IS_EMPTY     = 1,
+	WAKE_UP_PRODUCER_WHEN_POOL_IS_AVAILABLE = 2
+};
+
+enum {
 	JOB_TYPE_SCRAPE_TABLE = 0
 };
 
@@ -87,7 +92,7 @@ struct gwbiz_wrk {
 
 struct gwbiz_ctx {
 	volatile bool		stop_me;
-	volatile bool		producer_needs_wakeup;
+	uint8_t			producer_wake_flag;
 	struct gwbiz_wrk	workers[NUM_WORKERS];
 	pthread_mutex_t		lock;
 	pthread_cond_t		consumer_cond;
@@ -117,6 +122,20 @@ static void gwbiz_set_sighandler(struct gwbiz_ctx *ctx)
 	sigaction(SIGTERM, &sa, NULL);
 }
 
+static bool producer_need_wake_up(struct gwbiz_ctx *ctx)
+{
+	if (ctx->producer_wake_flag == 0)
+		return false;
+
+	if (ctx->producer_wake_flag == WAKE_UP_PRODUCER_WHEN_POOL_IS_AVAILABLE)
+		return ctx->head - ctx->tail < MAX_JOBS;
+
+	if (ctx->producer_wake_flag == WAKE_UP_PRODUCER_WHEN_POOL_IS_EMPTY)
+		return ctx->head == ctx->tail;
+
+	return false;
+}
+
 static int __gwbiz_wait_for_job(struct gwbiz_ctx *ctx)
 	__must_hold(ctx->lock)
 {
@@ -143,7 +162,7 @@ static int __gwbiz_get_job(struct gwbiz_wrk *wrk)
 
 	wrk->job = ctx->job_pool[ctx->head++ & ctx->mask];
 	wrk->has_job = true;
-	if (ctx->producer_needs_wakeup)
+	if (producer_need_wake_up(ctx))
 		pthread_cond_signal(&ctx->producer_cond);
 
 	return 0;
@@ -276,6 +295,8 @@ static void gwbiz_stop_workers(struct gwbiz_ctx *ctx)
 	pthread_mutex_lock(&ctx->lock);
 	ctx->stop_me = true;
 	pthread_cond_broadcast(&ctx->consumer_cond);
+	if (producer_need_wake_up(ctx))
+		pthread_cond_signal(&ctx->producer_cond);
 	pthread_mutex_unlock(&ctx->lock);
 }
 
@@ -304,7 +325,7 @@ static void *run_worker(void *wrk_)
 			break;
 	}
 
-	if (ctx->producer_needs_wakeup)
+	if (ctx->producer_wake_flag != 0)
 		pthread_cond_signal(&ctx->producer_cond);
 	pthread_mutex_unlock(&ctx->lock);
 
@@ -427,10 +448,30 @@ static int __gwbiz_wait_for_job_pool_free(struct gwbiz_ctx *ctx)
 	__must_hold(ctx->lock)
 {
 	while ((ctx->head - ctx->tail) >= MAX_JOBS) {
-		ctx->producer_needs_wakeup = true;
 		pthread_cond_broadcast(&ctx->consumer_cond);
+
+		ctx->producer_wake_flag = WAKE_UP_PRODUCER_WHEN_POOL_IS_AVAILABLE;
 		pthread_cond_wait(&ctx->producer_cond, &ctx->lock);
-		ctx->producer_needs_wakeup = false;
+		ctx->producer_wake_flag = 0;
+
+		/*
+		 * Must stop waiting if we are told to stop.
+		 */
+		if (ctx->stop_me)
+			return -1;
+	}
+
+	return 0;
+}
+
+static int __gwbiz_wait_for_job_pool_be_empty(struct gwbiz_ctx *ctx)
+	__must_hold(ctx->lock)
+{
+	while (ctx->head != ctx->tail) {
+
+		ctx->producer_wake_flag = WAKE_UP_PRODUCER_WHEN_POOL_IS_EMPTY;
+		pthread_cond_wait(&ctx->producer_cond, &ctx->lock);
+		ctx->producer_wake_flag = 0;
 
 		/*
 		 * Must stop waiting if we are told to stop.
@@ -498,21 +539,23 @@ static int gwbiz_run(struct gwbiz_ctx *ctx)
 		bool still_has_jobs = false;
 
 		for (i = 0; i < ARRAY_SIZE(tables); i++) {
-			if (__gwbiz_wait_for_job_pool_free(ctx))
-				break;
-
 			if (jobs[i].scrape_table.offset >= tables[i].end_offset)
 				continue;
 
 			still_has_jobs = true;
+			if (__gwbiz_wait_for_job_pool_free(ctx))
+				break;
+
 			if (__gwbiz_produce_job(ctx, &jobs[i]))
 				break;
 
 			jobs[i].scrape_table.offset += jobs[i].scrape_table.limit;
 		}
 
-		if (!still_has_jobs)
+		if (!still_has_jobs) {
+			__gwbiz_wait_for_job_pool_be_empty(ctx);
 			break;
+		}
 	}
 	pthread_mutex_unlock(&ctx->lock);
 
