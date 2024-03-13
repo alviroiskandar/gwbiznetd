@@ -1,0 +1,13 @@
+
+Biznet data leak scraper.
+
+## Usage
+sudo apt install -y gcc libcurl4-gnutls-dev make;
+make;
+./gwbiznetd;
+
+## License
+GNU General Public License v2.0
+
+-- 
+Alviro Iskandar Setiawan
